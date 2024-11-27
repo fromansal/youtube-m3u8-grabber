@@ -12,34 +12,46 @@ app = Flask(__name__)
 class YouTubeM3U8Grabber:
     def __init__(self):
         self.session = requests.Session()
-        self.headers = {
-            'User-Agent': 'com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8'
+        self.client_version = "18.48.37"
+        self.api_key = "AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8"
+        self.client = {
+            "clientName": "ANDROID",
+            "clientVersion": self.client_version,
+            "androidSdkVersion": 31,
+            "osName": "Android",
+            "osVersion": "12",
+            "platform": "MOBILE",
+            "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+            "userAgent": f"com.google.android.youtube/{self.client_version} (Linux; U; Android 12) gzip",
+            "timeZone": "UTC",
+            "browserName": "Chrome",
+            "browserVersion": "102.0.0.0",
+            "acceptHeader": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+            "deviceMake": "Google",
+            "deviceModel": "Pixel 6",
+            "utcOffsetMinutes": 0,
         }
-        self.session.headers.update(self.headers)
-        self.client_version = "17.31.35"
-        self.client_name = "ANDROID"
-        self.api_key = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
         self.context = {
-            "client": {
-                "clientName": self.client_name,
-                "clientVersion": self.client_version,
-                "androidSdkVersion": 30,
-                "osName": "Android",
-                "osVersion": "11",
-                "platform": "MOBILE"
-            },
-            "user": {
-                "lockedSafetyMode": False
+            "client": self.client,
+            "thirdParty": {
+                "embedUrl": "https://www.youtube.com"
             }
         }
+        self.headers = {
+            "User-Agent": self.client["userAgent"],
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": "3",
+            "X-YouTube-Client-Version": self.client_version,
+            "Origin": "https://www.youtube.com",
+            "Referer": "https://www.youtube.com"
+        }
+        self.session.headers.update(self.headers)
 
     def _get_video_info(self, video_id):
         """Get video info using innertube API."""
-        url = f"https://youtubei.googleapis.com/youtubei/v1/player?key={self.api_key}"
+        url = f"https://www.youtube.com/youtubei/v1/player?key={self.api_key}"
         
         data = {
             "videoId": video_id,
@@ -61,13 +73,48 @@ class YouTubeM3U8Grabber:
             print(f"Error getting video info: {str(e)}")
             return None
 
+    def _get_initial_data(self, video_id):
+        """Get initial data from watch page."""
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        try:
+            response = self.session.get(watch_url)
+            response.raise_for_status()
+            
+            # Extract ytInitialData
+            match = re.search(r'ytInitialData\s*=\s*({.+?});', response.text)
+            if match:
+                return json.loads(match.group(1))
+            return None
+        except Exception as e:
+            print(f"Error getting initial data: {str(e)}")
+            return None
+
     def extract_video_id_from_channel(self, channel_url):
         """Extract live video ID from a YouTube channel."""
         try:
+            # First try to get the channel page
             response = self.session.get(channel_url)
-            if response.status_code != 200:
-                return None
-
+            response.raise_for_status()
+            
+            # Look for initial data
+            match = re.search(r'ytInitialData\s*=\s*({.+?});', response.text)
+            if match:
+                data = json.loads(match.group(1))
+                
+                # Navigate through the data structure to find live video
+                tabs = data.get('contents', {}).get('twoColumnBrowseResultsRenderer', {}).get('tabs', [])
+                for tab in tabs:
+                    if 'tabRenderer' in tab:
+                        items = tab['tabRenderer'].get('content', {}).get('richGridRenderer', {}).get('contents', [])
+                        for item in items:
+                            if 'richItemRenderer' in item:
+                                video = item['richItemRenderer'].get('content', {}).get('videoRenderer', {})
+                                badges = video.get('badges', [])
+                                for badge in badges:
+                                    if badge.get('metadataBadgeRenderer', {}).get('label') == 'LIVE':
+                                        return video.get('videoId')
+            
+            # Fallback to regex patterns
             patterns = [
                 r'"videoId":"([^"]+)".*?"isLive":true',
                 r'href="/watch\?v=([^"]+)".*?isLive":true',
@@ -78,6 +125,7 @@ class YouTubeM3U8Grabber:
                 matches = re.findall(pattern, response.text)
                 if matches:
                     return matches[0]
+                    
             return None
         except Exception as e:
             print(f"Error extracting channel video ID: {str(e)}")
