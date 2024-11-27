@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: youtube-m3u8-grabber
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn youtube_m3u8_grabber:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
