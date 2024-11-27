@@ -1,7 +1,7 @@
 import requests
 import json
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 from flask import Flask, request, jsonify
 import os
 import random
@@ -89,44 +89,104 @@ class YouTubeM3U8Grabber:
             print(f"Error getting initial data: {str(e)}")
             return None
 
-    def extract_video_id_from_channel(self, channel_url):
-        """Extract live video ID from a YouTube channel."""
+    def _get_channel_id(self, channel_url):
+        """Get channel ID from custom URL."""
         try:
-            # First try to get the channel page
             response = self.session.get(channel_url)
             response.raise_for_status()
             
-            # Look for initial data
-            match = re.search(r'ytInitialData\s*=\s*({.+?});', response.text)
-            if match:
-                data = json.loads(match.group(1))
-                
-                # Navigate through the data structure to find live video
-                tabs = data.get('contents', {}).get('twoColumnBrowseResultsRenderer', {}).get('tabs', [])
-                for tab in tabs:
-                    if 'tabRenderer' in tab:
-                        items = tab['tabRenderer'].get('content', {}).get('richGridRenderer', {}).get('contents', [])
-                        for item in items:
-                            if 'richItemRenderer' in item:
-                                video = item['richItemRenderer'].get('content', {}).get('videoRenderer', {})
-                                badges = video.get('badges', [])
-                                for badge in badges:
-                                    if badge.get('metadataBadgeRenderer', {}).get('label') == 'LIVE':
-                                        return video.get('videoId')
+            # Try to find channel ID in meta tags
+            channel_id_match = re.search(r'<meta itemprop="channelId" content="([^"]+)">', response.text)
+            if channel_id_match:
+                return channel_id_match.group(1)
             
-            # Fallback to regex patterns
+            # Try to find channel ID in page source
+            channel_id_pattern = r'"channelId":"([^"]+)"'
+            channel_id_match = re.search(channel_id_pattern, response.text)
+            if channel_id_match:
+                return channel_id_match.group(1)
+                
+            return None
+        except Exception as e:
+            print(f"Error getting channel ID: {str(e)}")
+            return None
+
+    def _get_live_broadcast_content(self, channel_id):
+        """Get live broadcast content using YouTube Data API."""
+        url = f"https://www.youtube.com/youtubei/v1/browse?key={self.api_key}"
+        data = {
+            "context": self.context,
+            "browseId": channel_id,
+            "params": "EgJAAQ%3D%3D"  # Filter for live streams
+        }
+        
+        try:
+            response = self.session.post(url, json=data)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"Error getting live broadcast content: {str(e)}")
+            return None
+
+    def extract_video_id_from_channel(self, channel_url):
+        """Extract live video ID from a YouTube channel."""
+        try:
+            print(f"Processing channel URL: {channel_url}")
+            
+            # First, try to get channel ID
+            channel_id = self._get_channel_id(channel_url)
+            if channel_id:
+                print(f"Found channel ID: {channel_id}")
+                browse_data = self._get_live_broadcast_content(channel_id)
+                
+                if browse_data:
+                    # Try to find live video in browse response
+                    tabs = browse_data.get('contents', {}).get('twoColumnBrowseResultsRenderer', {}).get('tabs', [])
+                    for tab in tabs:
+                        if 'tabRenderer' in tab:
+                            items = tab['tabRenderer'].get('content', {}).get('richGridRenderer', {}).get('contents', [])
+                            for item in items:
+                                if 'richItemRenderer' in item:
+                                    video = item['richItemRenderer'].get('content', {}).get('videoRenderer', {})
+                                    badges = video.get('badges', [])
+                                    for badge in badges:
+                                        if badge.get('metadataBadgeRenderer', {}).get('label') == 'LIVE':
+                                            video_id = video.get('videoId')
+                                            if video_id:
+                                                print(f"Found live video ID: {video_id}")
+                                                return video_id
+            
+            # If channel ID method fails, try direct page scraping
+            print("Trying direct page scraping...")
+            response = self.session.get(channel_url)
+            response.raise_for_status()
+            page_content = response.text
+            
+            # Try multiple patterns
             patterns = [
                 r'"videoId":"([^"]+)".*?"isLive":true',
                 r'href="/watch\?v=([^"]+)".*?isLive":true',
-                r'data-video-id="([^"]+)".*?isLive":true'
+                r'data-video-id="([^"]+)".*?isLive":true',
+                r'"videoId":"([^"]+)".*?"badges":\[{"metadataBadgeRenderer":{"label":"LIVE"',
+                r'"url":"/watch\?v=([^"]+)".*?"badges":\[{"metadataBadgeRenderer":{"label":"LIVE"'
             ]
             
             for pattern in patterns:
-                matches = re.findall(pattern, response.text)
+                matches = re.findall(pattern, page_content)
                 if matches:
-                    return matches[0]
+                    video_id = matches[0]
+                    print(f"Found video ID using pattern: {video_id}")
                     
+                    # Verify if this is actually a live video
+                    watch_url = f'https://www.youtube.com/watch?v={video_id}'
+                    watch_response = self.session.get(watch_url)
+                    if 'isLive":true' in watch_response.text:
+                        print(f"Verified live video ID: {video_id}")
+                        return video_id
+            
+            print("No live video ID found")
             return None
+            
         except Exception as e:
             print(f"Error extracting channel video ID: {str(e)}")
             return None
@@ -136,11 +196,22 @@ class YouTubeM3U8Grabber:
         print(f"Extracting video ID from URL: {url}")
         
         if 'youtube.com/watch?v=' in url:
-            return parse_qs(urlparse(url).query)['v'][0]
+            video_id = parse_qs(urlparse(url).query)['v'][0]
+            print(f"Found video ID from watch URL: {video_id}")
+            return video_id
         elif 'youtu.be/' in url:
-            return url.split('youtu.be/')[-1].split('?')[0]
+            video_id = url.split('youtu.be/')[-1].split('?')[0]
+            print(f"Found video ID from short URL: {video_id}")
+            return video_id
         elif '/live' in url or 'youtube.com/channel/' in url or 'youtube.com/c/' in url:
-            return self.extract_video_id_from_channel(url)
+            video_id = self.extract_video_id_from_channel(url)
+            if video_id:
+                print(f"Found video ID from channel: {video_id}")
+            else:
+                print("Could not find video ID from channel")
+            return video_id
+        
+        print("URL format not recognized")
         return None
 
     def get_m3u8_urls(self, url):
@@ -150,7 +221,7 @@ class YouTubeM3U8Grabber:
             if not video_id:
                 raise ValueError("Could not extract video ID from URL")
 
-            print(f"Found video ID: {video_id}")
+            print(f"Processing video ID: {video_id}")
             
             # Get video info using innertube API
             video_info = self._get_video_info(video_id)
